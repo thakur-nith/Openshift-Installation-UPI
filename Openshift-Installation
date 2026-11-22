@@ -1,0 +1,275 @@
+1. Create mirror registry
+2. create haproxy
+3. create DNS server
+4. Make temporary server (helper server) with httpd
+5. Generating a Key Pair for SSH Access
+ssh-keygen -t rsa -b 4096 -N '' -f ~/.ssh/id_rsa
+This command generates a public and private key pair. Ensure the public key (~/.ssh/id_rsa.pub) is added to the nodes
+
+6. Obtaining the Installation Program
+[root@mirror ~]# export OCP_RELEASE=4.18.22
+[root@mirror ~]# export ARCH=x86_64
+[root@mirror ~]# export RELEASE_IMAGE=quay.io/openshift-release-dev/ocp-release:${OCP_RELEASE}-${ARCH}
+[root@mirror ~]# export BASE_URL=https://mirror.openshift.com/pub/openshift-v4/${ARCH}/clients/ocp/${OCP_RELEASE}
+[root@mirror ~]# curl -L -o openshift-install-linux.tar.gz ${BASE_URL}/openshift-install-linux-${OCP_RELEASE}.tar.gz
+[root@mirror ~]# tar -zxvf openshift-install-linux.tar.gz -C /usr/local/bin openshift-install
+[root@mirror ~]# curl -L -o openshift-client-linux.tar.gz ${BASE_URL}/openshift-client-linux-amd64-rhel9-${OCP_RELEASE}.tar.gz
+[root@mirror ~]# tar -zxvf openshift-client-linux.tar.gz -C /usr/local/bin oc kubectl
+# verify
+openshift-install version
+oc version --client
+
+7. Download your installation pull secret from the Red Hat OpenShift Cluster Manager 
+https://console.redhat.com/openshift/install/pull-secret
+
+8. RHCOS doesn't follow the OCP z-stream numbering reliable approach is to ask your 4.18.22 openshift-install which boot image it expects
+# Exact URLs this installer expects
+openshift-install coreos print-stream-json > rhcos-stream.json
+
+ISO_URL=$(jq -r '.architectures.x86_64.artifacts.metal.formats.iso.disk.location' rhcos-stream.json)
+RAW_URL=$(jq -r '.architectures.x86_64.artifacts.metal.formats."raw.gz".disk.location' rhcos-stream.json)
+echo $ISO_URL; echo $RAW_URL
+
+Download ISO and Raw images
+curl -L -O "$ISO_URL"
+curl -L -O "$RAW_URL"
+
+9. Creating the Installation Configuration File
+mkdir -p /home/user/ocp-install/
+cd /home/user/ocp-install
+openshift-install create install-config --dir=.                    ### This is for IPI. Use AI to generate install-config.yaml for platform=none
+
+Write install-config.yaml by hand (UPI, disconnected)
+mkdir -p ~/ocp-install && cd ~/ocp-install
+cat > install-config.yaml <<'EOF'
+apiVersion: v1
+baseDomain: example.com
+metadata:
+  name: ocp4
+compute:
+- name: worker
+  hyperthreading: Enabled
+  replicas: 0
+controlPlane:
+  name: master
+  hyperthreading: Enabled
+  replicas: 3
+networking:
+  networkType: OVNKubernetes
+  clusterNetwork:
+  - cidr: 10.128.0.0/14
+    hostPrefix: 23
+  serviceNetwork:
+  - 172.30.0.0/16
+  machineNetwork:
+  - cidr: 192.168.1.0/24          # <-- the subnet your node IPs are on
+platform:
+  none: {}
+fips: false
+pullSecret: '<PULL-SECRET-JSON-ON-ONE-LINE>'
+sshKey: '<CONTENTS-OF-/root/.ssh/id_rsa.pub>'
+additionalTrustBundle: |
+  -----BEGIN CERTIFICATE-----
+  <contents of /mirror-registry/quay-rootCA/rootCA.pem, indented 2 spaces>
+  -----END CERTIFICATE-----
+imageDigestSources:
+- mirrors:
+  - mirror.example.com:8443/openshift/release
+  source: quay.io/openshift-release-dev/ocp-v4.0-art-dev
+- mirrors:
+  - mirror.example.com:8443/openshift/release-images
+  source: quay.io/openshift-release-dev/ocp-release
+EOF
+
+E.G
+[root@mirror ocp-install]# PS=$(jq -c . /root/.mirror/auth.json)
+[root@mirror ocp-install]# SSH=$(cat /root/.ssh/id_rsa.pub)
+[root@mirror ocp-install]# CA=$(sed 's/^/  /' /mirror-registry/quay-rootCA/rootCA.pem)
+[root@mirror ocp-install]# cat > install-config.yaml <<EOF
+apiVersion: v1
+baseDomain: example.com
+metadata:
+  name: ocp4
+compute:
+- name: worker
+  hyperthreading: Enabled
+  replicas: 0
+controlPlane:
+  name: master
+  hyperthreading: Enabled
+  replicas: 3
+networking:
+  networkType: OVNKubernetes
+  clusterNetwork:
+  - cidr: 10.128.0.0/14
+    hostPrefix: 23
+  serviceNetwork:
+  - 172.30.0.0/16
+  machineNetwork:
+  - cidr: 192.168.1.0/24
+platform:
+  none: {}
+fips: false
+pullSecret: '${PS}'
+sshKey: '${SSH}'
+additionalTrustBundle: |
+${CA}
+imageDigestSources:
+- mirrors:
+  - mirror.example.com:8443/openshift/release
+  source: quay.io/openshift-release-dev/ocp-v4.0-art-dev
+- mirrors:
+  - mirror.example.com:8443/openshift/release-images
+  source: quay.io/openshift-release-dev/ocp-release
+EOF
+
+## check install-config syntax
+python3 -c "import yaml;yaml.safe_load(open('install-config.yaml'))" && echo OK
+
+10. Creating the Kubernetes Manifest and Ignition Config Files
+[root@mirror ocp-install]# openshift-install create manifests --dir .
+[root@mirror ocp-install]# ls -lrt
+total 24
+-rw-r--r-- 1 root root 5706 Nov 22 19:58 install-config.yaml_old
+-rw-r--r-- 1 root root 5736 Nov 22 20:01 install-config.yaml_bkpworking
+drwxr-x--- 2 root root 4096 Nov 22 20:01 manifests
+drwxr-x--- 2 root root 4096 Nov 22 20:01 openshift
+[root@mirror ocp-install]# ls -lrt openshift/
+total 28
+-rw-r----- 1 root root 1195 Nov 22 20:01 99_openshift-machineconfig_99-master-ssh.yaml
+-rw-r----- 1 root root 2454 Nov 22 20:01 99_openshift-cluster-api_master-user-data-secret.yaml
+-rw-r----- 1 root root 1195 Nov 22 20:01 99_openshift-machineconfig_99-worker-ssh.yaml
+-rw-r----- 1 root root 2454 Nov 22 20:01 99_openshift-cluster-api_worker-user-data-secret.yaml
+-rw-r----- 1 root root  174 Nov 22 20:01 openshift-install-manifests.yaml
+-rw-r----- 1 root root  181 Nov 22 20:01 99_kubeadmin-password-secret.yaml
+-rw-r----- 1 root root  143 Nov 22 20:01 99_feature-gate.yaml
+[root@mirror ocp-install]#
+[root@mirror ocp-install]# ls -lrt manifests/
+total 60
+-rw-r----- 1 root root 1695 Nov 22 20:01 user-ca-bundle-config.yaml
+-rw-r----- 1 root root 3949 Nov 22 20:01 openshift-config-secret-pull-secret.yaml
+-rw-r----- 1 root root 4110 Nov 22 20:01 machine-config-server-tls-secret.yaml
+-rw-r----- 1 root root 1304 Nov 22 20:01 kube-system-configmap-root-ca.yaml
+-rw-r----- 1 root root  118 Nov 22 20:01 kube-cloud-config.yaml
+-rw-r----- 1 root root  407 Nov 22 20:01 image-digest-mirror-set.yaml
+-rw-r----- 1 root root  200 Nov 22 20:01 cvo-overrides.yaml
+-rw-r----- 1 root root  229 Nov 22 20:01 cluster-scheduler-02-config.yml
+-rw-r----- 1 root root  142 Nov 22 20:01 cluster-proxy-01-config.yaml
+-rw-r----- 1 root root  448 Nov 22 20:01 cluster-network-02-config.yml
+-rw-r----- 1 root root  220 Nov 22 20:01 cluster-ingress-02-config.yml
+-rw-r----- 1 root root  508 Nov 22 20:01 cluster-infrastructure-02-config.yml
+-rw-r----- 1 root root  184 Nov 22 20:01 cluster-dns-02-config.yml
+-rw-r----- 1 root root 3695 Nov 22 20:01 cluster-config.yaml
+[root@mirror ocp-install]#
+### For Compact cluster (only master nodes) keep mastersSchedulable =  true
+grep mastersSchedulable manifests/cluster-scheduler-02-config.yml
+# mastersSchedulable: true   ← correct for compact cluster. Replace it to false if you have worker nodes
+
+# If you have 3 workers, so keep application pods off the masters
+sed -i 's/mastersSchedulable: true/mastersSchedulable: false/' manifests/cluster-scheduler-02-config.yml
+grep mastersSchedulable manifests/cluster-scheduler-02-config.yml
+
+### Generate the Ignition files
+openshift-install create ignition-configs --dir .
+
+11. Creating a Web Server on the same Installation VM/Different VM
+dnf install -y httpd
+[root@helper ~]# nano /etc/httpd/conf/httpd.conf                  ### change port to 8080 or something else if using same VM for helper
+[root@helper ~]# mkdir -p /var/www/html/ocp4
+[root@helper ~]# scp root@192.168.1.8:/root/ocp-install/worker.ign /var/www/html/ocp4/
+[root@helper ~]# scp root@192.168.1.8:/root/ocp-install/master.ign /var/www/html/ocp4/
+[root@helper ~]# scp root@192.168.1.8:/root/ocp-install/bootstrap.ign /var/www/html/ocp4/
+[root@helper ~]# chmod 644 /var/www/html/ocp4/*.ign
+[root@helper ~]# systemctl start httpd
+[root@helper ~]# curl -sI http://192.168.1.11/ocp4/bootstrap.ign
+
+
+12. Bootstrap VM: IP from DHCP, DNS from 192.168.1.8
+1. Attach and boot the ISO  (to bootstrap vm first)
+2. Keep the DHCP IP but replace the DNS server
+ip -br a                         # NIC name and the DHCP IP you got
+nmcli con show                   # connection name, e.g. "Wired connection 1"
+sudo nmcli con mod "Wired connection 1" \
+  ipv4.method auto \
+  ipv4.ignore-auto-dns yes \
+  ipv4.dns 192.168.1.8 \
+  ipv4.dns-search ocp4.example.com
+sudo nmcli con up "Wired connection 1"
+sudo hostnamectl set-hostname bootstrap.ocp4.example.com
+cat /etc/resolv.conf             # nameserver 192.168.1.8 only
+
+3. Test, then install
+dig +short api-int.ocp4.example.com
+dig +short mirror.example.com
+curl -sI http://192.168.1.11/ocp4/bootstrap.ign | head -1
+Do the installation:(once completed, reboot and eject CD-ROM)
+sudo coreos-installer install /dev/sda --ignition-url http://192.168.1.11/ocp4/bootstrap.ign --insecure-ignition  --copy-network
+## After reboot, login from VM whose ssh-key files is added to ignition file. In this case bastion/mirror node
+# ssh core@192.168.1.24
+[core@bs01 ~]$ cat /etc/redhat-release
+## Check the bootstrap (5–15 minutes after the reboot)
+[core@bs01 ~]$ journalctl -b -f -u release-image.service -u bootkube.service
+[core@bs01 ~]$ sudo crictl ps | grep -E 'etcd|kube-apiserver|machine-config-server'   # should show running containers
+[core@bs01 ~]$ curl -sk https://localhost:22623/config/master | head -c 100; echo     # MCS answering (JSON)
+[core@bs01 ~]$ curl -sk https://api-int.ocp4.example.com:22623/config/master | head -c 100; echo
+[core@bs01 ~]$ curl -sk https://api.ocp4.example.com:6443/version
+
+4. Now follow same process for Master nodes
+>Attach and boot the ISO
+>Perform necessary IP configuration
+>sudo hostnamectl set-hostname master01.ocp4.example.com
+>curl -sI http://192.168.1.11/ocp4/master.ign | head -1
+>sudo coreos-installer install /dev/sda --ignition-url http://192.168.1.11/ocp4/master.ign --insecure-ignition  --copy-network
+>Disconnect ISO
+>Reboot and wait for installation to complete
+>Once a master is up from disk, SSH to it from the mirror host and check for logs:
+ssh core@192.168.1.21
+sudo journalctl -b -f -u kubelet -u crio      # look for image pull errors / "Successfully registered node"
+#### In case of VMware Workstation desired DNS was not picked. To resolve it:
+sudo -i
+# check what br-ex has now
+nmcli -f ipv4.method,ipv4.addresses,ipv4.dns,ipv4.ignore-auto-dns con show ovs-if-br-ex
+# fix the active profile (br-ex)
+nmcli con mod ovs-if-br-ex ipv4.ignore-auto-dns yes ipv4.dns 192.168.1.8 ipv4.dns-search ocp4.example.com
+# also fix the original profile, because configure-ovs rebuilds br-ex from it on every boot
+nmcli con mod "Wired connection 1" ipv4.ignore-auto-dns yes ipv4.dns 192.168.1.8 ipv4.dns-search ocp4.example.com
+# apply without a full down/up
+nmcli device reapply br-ex
+cat /etc/resolv.conf                       # nameserver 192.168.1.8
+getent hosts api-int.ocp4.example.com      # (dig isn't installed on RHCOS)
+getent hosts mirror.example.com
+
+# the kubelet has been failing for a while, so give it a clean restart
+systemctl restart kubelet
+
+### In case of One of the node not registering (/var/lib/kubelet/pki/ doesn't exist, so the kubelet has never been issued a certificate.)
+a. copy kubeconfig from healthy master (ls -l /etc/kubernetes/kubeconfig;md5sum /etc/kubernetes/kubeconfig)
+scp core@master01.ocp4.example.com:/etc/kubernetes/kubeconfig /tmp/bootstrap-kubeconfig
+scp /tmp/bootstrap-kubeconfig core@master03.ocp4.example.com:/tmp/
+b. Then on failed Master
+cp -a /etc/kubernetes/kubeconfig /root/kubeconfig.bak 2>/dev/null
+install -m 600 -o root -g root /tmp/bootstrap-kubeconfig /etc/kubernetes/kubeconfig
+restorecon -v /etc/kubernetes/kubeconfig
+rm -f /var/lib/kubelet/kubeconfig
+systemctl restart kubelet
+journalctl -u kubelet -f | grep -iE 'csr|certificate|registered|anonymous|forbidden'
+
+## Approve the CSRs if they stay pending ### on Mirror/bastion
+oc get csr | grep -i pending
+oc get csr -o name | xargs oc adm certificate approve   # run again a minute later for the serving cert
+oc get nodes
+
+>>> Similiarly follow for Master02 and Master03
+
+### verification
+[root@mirror ocp-install]# oc get nodes
+[root@mirror ocp-install]# oc get co
+[root@mirror ocp-install]# dig +short oauth-openshift.apps.ocp4.example.com   # → HAProxy IP
+[root@mirror ocp-install]# curl -sk -o /dev/null -w '%{http_code}\n' https://oauth-openshift.apps.ocp4.example.com/healthz   # expect 200
+
+Keep checking bootstrap status
+[root@mirror ocp-install]# openshift-install wait-for bootstrap-complete --dir . --log-level=info
+## Once boostrap node work is done, poweroff and remove it from haproxy
+[root@mirror ocp-install]# nano /etc/haproxy/haproxy.cfg
+[root@mirror ocp-install]# systemctl reload haproxy
+[root@mirror ocp-install]# curl -sk -o /dev/null -w '%{http_code}\n' https://oauth-openshift.apps.ocp4.example.com/healthz   # 200
