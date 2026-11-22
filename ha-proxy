@@ -1,3 +1,7 @@
+HA proxy installation
+[root@mirror ~]# dnf -y install haproxy
+
+HA Proxy Configuration
 [root@mirror ~]# cat /etc/haproxy/haproxy.cfg
 #---------------------------------------------------------------------
 # Example configuration for a possible web application.  See the
