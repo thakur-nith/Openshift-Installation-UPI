@@ -1,0 +1,170 @@
+1. Install BIND
+[root@mirror ~]# dnf install -y bind bind-utils
+
+2. Write /etc/named.conf
+cp /etc/named.conf /etc/named.conf.orig
+
+cat > /etc/named.conf <<'EOF'
+// Only these sources get answers; everything else gets REFUSED
+acl "ocp4-clients" {
+    localhost;
+    192.168.1.8; 192.168.1.11;                              // helper / ns1 / smtp / api / api-int
+    192.168.1.21; 192.168.1.22; 192.168.1.23; // master01-03
+    192.168.1.24;                             // bs01 (bootstrap)
+    192.168.1.25; 192.168.1.26;               // worker01-02
+    192.168.1.99;                             // control-plane2
+};
+
+options {
+    listen-on port 53 { 127.0.0.1; 192.168.1.8; };
+    listen-on-v6 port 53 { none; };
+    directory           "/var/named";
+    dump-file           "/var/named/data/cache_dump.db";
+    statistics-file     "/var/named/data/named_stats.txt";
+    memstatistics-file  "/var/named/data/named_mem_stats.txt";
+    secroots-file       "/var/named/data/named.secroots";
+    recursing-file      "/var/named/data/named.recursing";
+
+    allow-query       { ocp4-clients; };
+    allow-query-cache { ocp4-clients; };
+    allow-recursion   { ocp4-clients; };
+    allow-transfer    { none; };
+
+    // Nodes must resolve quay.io / registry.redhat.io etc. (connected install)
+    recursion yes;
+    forwarders { 8.8.8.8; 1.1.1.1; };   // <-- change to your upstream/corporate DNS
+    forward only;
+
+    dnssec-validation yes;   // set to "no" if your upstream DNS breaks DNSSEC
+
+    managed-keys-directory "/var/named/dynamic";
+    geoip-directory "/usr/share/GeoIP";
+    pid-file "/run/named/named.pid";
+    session-keyfile "/run/named/session.key";
+    include "/etc/crypto-policies/back-ends/bind.config";
+};
+
+logging {
+    channel default_debug {
+        file "data/named.run";
+        severity dynamic;
+    };
+};
+
+zone "." IN {
+    type hint;
+    file "named.ca";
+};
+
+include "/etc/named.rfc1912.zones";
+include "/etc/named.root.key";
+
+// ---------- OpenShift lab zones ----------
+zone "example.com" IN {
+    type master;
+    file "example.com.zone";
+    allow-update { none; };
+};
+
+zone "1.168.192.in-addr.arpa" IN {
+    type master;
+    file "1.168.192.in-addr.arpa.zone";
+    allow-update { none; };
+};
+EOF
+
+3. Create the forward zone
+
+cat > /var/named/example.com.zone <<'EOF'
+$TTL 1W
+@	IN	SOA	ns1.example.com.	root (
+			2026112201	; serial
+			3H		; refresh (3 hours)
+			30M		; retry (30 minutes)
+			2W		; expiry (2 weeks)
+			1W )		; minimum (1 week)
+	IN	NS	ns1.example.com.
+	IN	MX 10	smtp.example.com.
+;
+ns1.example.com.		IN	A	192.168.1.8
+smtp.example.com.		IN	A	192.168.1.8
+;
+helper.example.com.		IN	A	192.168.1.11
+helper.ocp4.example.com.	IN	A	192.168.1.11
+;
+api.ocp4.example.com.		IN	A	192.168.1.8
+api-int.ocp4.example.com.	IN	A	192.168.1.8
+;
+*.apps.ocp4.example.com.	IN	A	192.168.1.8
+;
+bs01.ocp4.example.com.		IN	A	192.168.1.24
+;
+master01.ocp4.example.com.	IN	A	192.168.1.21
+master02.ocp4.example.com.	IN	A	192.168.1.22
+master03.ocp4.example.com.	IN	A	192.168.1.23
+;
+control-plane2.ocp4.example.com.	IN	A	192.168.1.99
+;
+worker01.ocp4.example.com.	IN	A	192.168.1.25
+worker02.ocp4.example.com.	IN	A	192.168.1.26
+;EOF
+EOF
+
+4. Create the reverse (PTR) zone
+cat > /var/named/1.168.192.in-addr.arpa.zone <<'EOF'
+$TTL 1W
+@	IN	SOA	ns1.example.com.	root.example.com. (
+			2026112201	; serial
+			3H		; refresh
+			30M		; retry
+			2W		; expiry
+			1W )		; minimum
+	IN	NS	ns1.example.com.
+;
+11	IN	PTR	helper.ocp4.example.com.
+8	IN	PTR	api.ocp4.example.com.
+8	IN	PTR	api-int.ocp4.example.com.
+;
+24	IN	PTR	bs01.ocp4.example.com.
+;
+21	IN	PTR	master01.ocp4.example.com.
+22	IN	PTR	master02.ocp4.example.com.
+23	IN	PTR	master03.ocp4.example.com.
+;
+25	IN	PTR	worker01.ocp4.example.com.
+26	IN	PTR	worker02.ocp4.example.com.
+;EOF
+EOF
+
+5. Fix ownership and SELinux labels
+chown root:named /var/named/example.com.zone /var/named/1.168.192.in-addr.arpa.zone
+chmod 640 /var/named/example.com.zone /var/named/1.168.192.in-addr.arpa.zone
+restorecon -Rv /var/named /etc/named.conf
+
+6. Check the syntax before starting
+named-checkconf /etc/named.conf
+named-checkzone example.com /var/named/example.com.zone
+named-checkzone 1.168.192.in-addr.arpa /var/named/1.168.192.in-addr.arpa.zone
+
+7. Open the firewall and start named
+firewall-cmd --permanent --add-service=dns
+firewall-cmd --reload
+
+systemctl enable --now named
+systemctl status named
+
+8. [root@mirror ~]# systemctl restart named
+9. Test
+# Forward lookups
+dig @192.168.1.8 api.ocp4.example.com +short
+dig @192.168.1.8 api-int.ocp4.example.com +short
+dig @192.168.1.8 console-openshift-console.apps.ocp4.example.com +short   # wildcard -> 192.168.1.8
+dig @192.168.1.8 master01.ocp4.example.com +short
+
+# Reverse lookups
+dig @192.168.1.8 -x 192.168.1.21 +short    # master01.ocp4.example.com.
+dig @192.168.1.8 -x 192.168.1.25 +short    # worker01.ocp4.example.com.
+dig @192.168.1.8 -x 192.168.1.8  +short
+
+# Outside names (forwarding)
+dig @192.168.1.8 quay.io +short
