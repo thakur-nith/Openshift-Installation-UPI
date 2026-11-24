@@ -1,0 +1,56 @@
+#!/bin/bash
+# usage: opinfo.sh <package> <namespace>     e.g. opinfo.sh compliance-operator openshift-compliance
+PKG=${1:?usage: opinfo.sh <package> <namespace>}; NS=${2:?namespace}
+
+SUB=$(oc get sub -n "$NS" -o json | jq -c --arg p "$PKG" '.items[] | select(.spec.name==$p)')
+[ -z "$SUB" ] && { echo "No Subscription for package '$PKG' in namespace '$NS'"; exit 1; }
+CSV=$(jq -r '.status.installedCSV // empty' <<<"$SUB")
+IP=$(jq -r '.status.installPlanRef.name // .status.installplan.name // empty' <<<"$SUB")
+
+echo "== Subscription (how it was requested)"
+jq -r '
+  "  Name            -> \(.metadata.name)",
+  "  Package         -> \(.spec.name)",
+  "  Channel         -> \(.spec.channel // "-")",
+  "  Catalog         -> \(.spec.source) (\(.spec.sourceNamespace))",
+  "  Approval        -> \(.spec.installPlanApproval // "Automatic")",
+  "  Starting CSV    -> \(.spec.startingCSV // "-")",
+  "  Installed CSV   -> \(.status.installedCSV // "-")",
+  "  Latest in chan  -> \(.status.currentCSV // "-")",
+  "  State           -> \(.status.state // "-")"' <<<"$SUB"
+
+echo; echo "== CSV (what is installed)"
+[ -n "$CSV" ] && oc get csv "$CSV" -n "$NS" -o json | jq -r '
+  "  Name            -> \(.metadata.name)",
+  "  Display name    -> \(.spec.displayName)",
+  "  Version         -> \(.spec.version)",
+  "  Phase           -> \(.status.phase)  (\(.status.reason // "-"))",
+  "  Replaces        -> \(.spec.replaces // "-")",
+  "  skipRange       -> \(.metadata.annotations["olm.skipRange"] // "-")",
+  "  OperatorGroup   -> \(.metadata.annotations["olm.operatorGroup"] // "-")",
+  "  Watches         -> \((.metadata.annotations["olm.targetNamespaces"] // null) | if . == null then "-" elif . == "" then "ALL namespaces" else . end)",
+  "  Provider        -> \(.spec.provider.name // "-")",
+  "  Min Kubernetes  -> \(.spec.minKubeVersion // "-")",
+  "  Deployments     -> \([.spec.install.spec.deployments[]?.name] | join(", "))",
+  "  Owned CRDs      -> \(.spec.customresourcedefinitions.owned | length)",
+  "  Related images  -> \(.spec.relatedImages | length)",
+  "  Installed at    -> \(.metadata.creationTimestamp)"'
+
+echo; echo "== InstallPlan (the approved work order)"
+[ -n "$IP" ] && oc get installplan "$IP" -n "$NS" -o json | jq -r '
+  "  Name            -> \(.metadata.name)",
+  "  CSVs            -> \(.spec.clusterServiceVersionNames | join(", "))",
+  "  Approval        -> \(.spec.approval)",
+  "  Approved        -> \(.spec.approved)",
+  "  Phase           -> \(.status.phase // "-")"'
+
+echo; echo "== InstallPlans waiting for approval"
+oc get installplan -n "$NS" -o json | jq -r '
+  [.items[] | select(.spec.approved==false)] |
+  if length==0 then "  none" else .[] | "  \(.metadata.name) -> \(.spec.clusterServiceVersionNames|join(", "))" end'
+
+echo; echo "== Deployments"
+oc get deploy -n "$NS" -o custom-columns='  NAME:.metadata.name,READY:.status.readyReplicas,WANTED:.spec.replicas,IMAGE:.spec.template.spec.containers[0].image' | cut -c1-150
+
+#chmod +x /usr/local/bin/opinfo.sh
+#opinfo.sh compliance-operator openshift-compliance
