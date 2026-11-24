@@ -1,0 +1,23 @@
+CSV=compliance-operator.v1.10.1; NS=openshift-compliance
+printf "%-24s %6s   %s\n" KIND COUNT "EXAMPLES"
+printf "%-24s %6s   %s\n" ---- ----- "--------"
+for crd in $(oc get csv $CSV -n $NS -o jsonpath='{.spec.customresourcedefinitions.owned[*].name}'); do
+  kind=$(oc get crd "$crd" -o jsonpath='{.spec.names.kind}')
+  names=$(oc get "$crd" -A -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null)
+  count=$(wc -w <<<"$names")
+  printf "%-24s %6s   %s\n" "$kind" "$count" "$(cut -c1-70 <<<"$names")"
+done
+
+or
+CSV=compliance-operator.v1.10.1; NS=openshift-compliance
+
+# CRDs the operator owns (= the CRs it watches/reconciles)
+oc get csv $CSV -n $NS -o json | jq -r '
+  "OWNED:",    (.spec.customresourcedefinitions.owned[]?    | "  \(.kind)\t\(.name)\t\(.version)"),
+  "REQUIRED:", (.spec.customresourcedefinitions.required[]? | "  \(.kind)\t\(.name)\t\(.version)")'
+
+# Existing instances (CRs) of each owned CRD
+for crd in $(oc get csv $CSV -n $NS -o jsonpath='{.spec.customresourcedefinitions.owned[*].name}'); do
+  echo "== $crd"; oc get $crd -A --no-headers 2>/dev/null | head -5
+done
+
